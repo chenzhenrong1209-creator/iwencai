@@ -2,19 +2,12 @@ import os
 import json
 import shlex
 import subprocess
-import re
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-
-st.set_page_config(
-    page_title="爱问财 SkillHub CLI 测试台",
-    page_icon="🧪",
-    layout="wide",
-)
+st.set_page_config(page_title="爱问财 SkillHub CLI 测试台 v2", page_icon="🧪", layout="wide")
 
 OFFICIAL_SKILLS = [
     "hithink-sector-selector",
@@ -43,7 +36,6 @@ def get_secret(name: str, default: str = "") -> str:
 def get_iwencai_env() -> Dict[str, str]:
     base_url = get_secret("IWENCAI_BASE_URL", DEFAULT_BASE_URL)
     api_key = get_secret("IWENCAI_API_KEY", "")
-
     try:
         section = st.secrets.get("iwencai", {})
         if isinstance(section, dict):
@@ -51,10 +43,19 @@ def get_iwencai_env() -> Dict[str, str]:
             api_key = str(section.get("api_key") or api_key).strip()
     except Exception:
         pass
-
     env = os.environ.copy()
     env["IWENCAI_BASE_URL"] = base_url or DEFAULT_BASE_URL
     env["IWENCAI_API_KEY"] = api_key or ""
+    extra_paths = [
+        os.path.expanduser("~/.local/bin"),
+        os.path.expanduser("~/.openclaw/bin"),
+        os.path.expanduser("~/.skillhub/bin"),
+        os.path.expanduser("~/.npm-global/bin"),
+        os.path.expanduser("~/.npm/bin"),
+        "/mount/src/iwencai/.bin",
+        "/mount/src/iwencai/node_modules/.bin",
+    ]
+    env["PATH"] = ":".join(extra_paths + [env.get("PATH", "")])
     return env
 
 
@@ -77,19 +78,11 @@ def run_cmd(cmd: str, timeout: int = 30, env: Optional[Dict[str, str]] = None) -
             env=env or get_iwencai_env(),
             executable="/bin/bash",
         )
-        return p.returncode, (p.stdout or "")[-12000:], (p.stderr or "")[-12000:]
+        return p.returncode, (p.stdout or "")[-16000:], (p.stderr or "")[-16000:]
     except subprocess.TimeoutExpired as e:
         return 124, e.stdout or "", (e.stderr or "") + f"\n[TIMEOUT] 超过 {timeout} 秒未返回"
     except Exception as e:
         return 999, "", repr(e)
-
-
-def which_many(names: List[str]) -> pd.DataFrame:
-    rows = []
-    for name in names:
-        _, out, _ = run_cmd(f"command -v {shlex.quote(name)} || true", timeout=5)
-        rows.append({"命令": name, "路径": out.strip(), "是否存在": bool(out.strip())})
-    return pd.DataFrame(rows)
 
 
 def extract_json_like(text: str):
@@ -100,7 +93,6 @@ def extract_json_like(text: str):
         return json.loads(text)
     except Exception:
         pass
-
     objects = []
     for line in text.splitlines():
         line = line.strip()
@@ -132,7 +124,6 @@ def render_cmd_result(code: int, out: str, err: str):
         st.success(f"命令执行成功，退出码 {code}")
     else:
         st.error(f"命令执行失败，退出码 {code}")
-
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### STDOUT")
@@ -140,7 +131,6 @@ def render_cmd_result(code: int, out: str, err: str):
     with c2:
         st.markdown("#### STDERR")
         st.code(err or "无输出", language="text")
-
     parsed = extract_json_like(out)
     if parsed is not None:
         st.markdown("#### JSON 解析")
@@ -148,11 +138,46 @@ def render_cmd_result(code: int, out: str, err: str):
         rows = flatten_json(parsed)
         if rows:
             st.markdown("#### 摊平表格")
-            st.dataframe(pd.DataFrame(rows).head(200), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows).head(200), width="stretch")
 
 
-st.title("🧪 爱问财 SkillHub CLI 版 Streamlit 测试台")
-st.caption("目标：不再猜 REST 路径，而是按官方方式安装/调用 CLI，观察真实命令、真实输出和真实错误。")
+def which_many(names: List[str]) -> pd.DataFrame:
+    rows = []
+    for name in names:
+        _, out, _ = run_cmd(f"command -v {shlex.quote(name)} || true", timeout=5)
+        rows.append({"命令": name, "路径": out.strip(), "是否存在": bool(out.strip())})
+    return pd.DataFrame(rows)
+
+
+def cli_probe_commands() -> str:
+    return """
+echo "===== basic ====="
+python --version || true
+node --version || true
+npm --version || true
+unzip -v | head -2 || true
+curl --version | head -1 || true
+
+echo "===== PATH ====="
+echo "$PATH"
+
+echo "===== command probe ====="
+for c in skillhub iwencai wencai claw openclaw npx node npm unzip; do
+  printf "%-12s -> " "$c"
+  command -v "$c" || true
+done
+
+echo "===== home dirs ====="
+ls -la ~ | head -80
+echo "--- ~/.openclaw ---"; ls -la ~/.openclaw 2>/dev/null || true
+echo "--- ~/.skillhub ---"; ls -la ~/.skillhub 2>/dev/null || true
+echo "--- ~/.local/bin ---"; ls -la ~/.local/bin 2>/dev/null || true
+echo "--- node_modules/.bin ---"; ls -la node_modules/.bin 2>/dev/null || true
+"""
+
+
+st.title("🧪 爱问财 SkillHub CLI 版 Streamlit 测试台 v2")
+st.caption("v2 修复重点：增加 packages.txt 安装 unzip，并主动把 CLI 可能安装目录加入 PATH。")
 
 env = get_iwencai_env()
 base_url = env.get("IWENCAI_BASE_URL", "")
@@ -163,109 +188,77 @@ with st.sidebar:
     st.write("IWENCAI_BASE_URL：", base_url)
     st.write("IWENCAI_API_KEY：", mask_key(api_key))
     st.markdown("---")
-    st.info(
-        "Streamlit Secrets 建议：\n\n"
-        'IWENCAI_BASE_URL = "https://openapi.iwencai.com"\n'
-        'IWENCAI_API_KEY = "你的新 Key"\n\n'
-        "或：\n\n"
-        "[iwencai]\n"
-        'base_url = "https://openapi.iwencai.com"\n'
-        'api_key = "你的新 Key"'
-    )
+    st.info('Secrets 推荐：\n\nIWENCAI_BASE_URL = "https://openapi.iwencai.com"\nIWENCAI_API_KEY = "你的新 Key"')
     st.warning("不要在聊天窗口、GitHub 或代码里明文写 API Key。")
 
 if not api_key:
     st.error("未读取到 IWENCAI_API_KEY。请先配置 Streamlit Secrets。")
     st.stop()
 
-tabs = st.tabs(["1 环境检查", "2 安装 CLI", "3 技能安装", "4 技能调用", "5 自定义命令", "6 接回主系统建议"])
+tabs = st.tabs(["1 环境检查", "2 官方安装", "3 技能安装", "4 技能调用", "5 自定义命令", "6 结论"])
 
 with tabs[0]:
     st.subheader("环境检查")
-
-    st.markdown("#### Python / Shell / Node")
-    code, out, err = run_cmd("python --version && node --version 2>/dev/null || true && npm --version 2>/dev/null || true && uname -a", timeout=10)
+    code, out, err = run_cmd(cli_probe_commands(), timeout=20)
     render_cmd_result(code, out, err)
-
-    st.markdown("#### 可能的 CLI 命令探测")
-    candidates = ["skillhub", "iwencai", "wencai", "claw", "openclaw", "npx", "node", "npm"]
-    st.dataframe(which_many(candidates), use_container_width=True)
-
-    st.markdown("#### 相关目录探测")
-    code, out, err = run_cmd(
-        "ls -la ~ 2>/dev/null | head -100; "
-        "echo '--- ~/.openclaw ---'; ls -la ~/.openclaw 2>/dev/null || true; "
-        "echo '--- ~/.skillhub ---'; ls -la ~/.skillhub 2>/dev/null || true; "
-        "echo '--- current ---'; pwd && ls -la",
-        timeout=10,
-    )
-    render_cmd_result(code, out, err)
+    st.markdown("#### CLI 命令探测表")
+    st.dataframe(which_many(["skillhub", "iwencai", "wencai", "claw", "openclaw", "npx", "node", "npm", "unzip"]), width="stretch")
 
 with tabs[1]:
-    st.subheader("安装 CLI")
-    st.warning("Streamlit Cloud 的运行环境可能重建，CLI 安装不一定永久保留。本页用于测试官方 CLI 能否在云端安装和执行。")
-
-    install_cmd = f"""
+    st.subheader("执行官方安装脚本")
+    st.warning("如果这里仍失败，请重点看 STDERR。v1 的失败原因是缺少 unzip；v2 已通过 packages.txt 安装 unzip。")
+    install_cmd = f'''
 set -e
-curl -fsSL {INSTALL_URL} -o /tmp/iwencai_skillhub_install.sh
-bash /tmp/iwencai_skillhub_install.sh
-echo "---- after install ----"
-command -v skillhub || true
-command -v iwencai || true
-command -v claw || true
-command -v openclaw || true
-ls -la ~/.openclaw 2>/dev/null || true
-ls -la ~/.skillhub 2>/dev/null || true
-"""
-    st.code(install_cmd, language="bash")
+echo "===== dependency check ====="
+command -v unzip
+command -v curl
+node --version || true
+npm --version || true
 
-    timeout = st.slider("安装超时秒数", 30, 300, 120, key="install_timeout")
+echo "===== download installer ====="
+curl -fsSL {INSTALL_URL} -o /tmp/iwencai_skillhub_install.sh
+sed -n '1,220p' /tmp/iwencai_skillhub_install.sh
+
+echo "===== run installer ====="
+bash /tmp/iwencai_skillhub_install.sh
+
+echo "===== after install probe ====="
+''' + cli_probe_commands()
+    st.code(install_cmd, language="bash")
+    timeout = st.slider("安装超时秒数", 30, 360, 180)
     if st.button("🚀 执行官方安装脚本", type="primary"):
-        with st.spinner("正在执行官方安装脚本..."):
-            code, out, err = run_cmd(install_cmd, timeout=timeout)
+        code, out, err = run_cmd(install_cmd, timeout=timeout)
         render_cmd_result(code, out, err)
 
 with tabs[2]:
-    st.subheader("技能安装")
-    st.write("如果 CLI 已安装，尝试安装官方技能。不同 CLI 的命令名可能不同，所以这里提供多种候选命令。")
-
+    st.subheader("安装技能")
     skill = st.selectbox("选择技能", OFFICIAL_SKILLS)
     cli_name = st.selectbox("CLI 命令名", ["skillhub", "iwencai", "claw", "openclaw", "npx skillhub"], index=0)
-
     install_variants = [
         f"{cli_name} install {skill}",
         f"{cli_name} skill install {skill}",
         f"{cli_name} add {skill}",
         f"{cli_name} skills install {skill}",
+        f"{cli_name} list",
         f"{cli_name} --help",
     ]
-
-    selected_cmd = st.selectbox("选择安装命令候选", install_variants)
+    selected_cmd = st.selectbox("选择命令候选", install_variants)
     st.code(selected_cmd, language="bash")
-
     if st.button("📦 执行技能安装/探测", type="primary"):
-        code, out, err = run_cmd(selected_cmd, timeout=90)
+        code, out, err = run_cmd(selected_cmd, timeout=120)
         render_cmd_result(code, out, err)
-
-    st.markdown("#### 一键尝试安装全部技能")
+    st.markdown("#### 一键安装全部技能")
     all_cmd = "\n".join([f"{cli_name} install {s} || true" for s in OFFICIAL_SKILLS])
     st.code(all_cmd, language="bash")
     if st.button("📦 尝试安装全部技能"):
-        code, out, err = run_cmd(all_cmd, timeout=240)
+        code, out, err = run_cmd(all_cmd, timeout=300)
         render_cmd_result(code, out, err)
 
 with tabs[3]:
-    st.subheader("技能调用")
-
-    skill = st.selectbox("选择要调用的技能", OFFICIAL_SKILLS, key="run_skill")
+    st.subheader("调用技能")
+    skill = st.selectbox("选择技能", OFFICIAL_SKILLS, key="run_skill")
     cli_name = st.selectbox("CLI 命令名", ["skillhub", "iwencai", "claw", "openclaw", "npx skillhub"], index=0, key="run_cli")
-
-    query = st.text_area(
-        "查询内容",
-        value="今日A股行业板块资金流入排名，显示板块名称、涨跌幅、主力净流入、成交额、领涨股",
-        height=90,
-    )
-
+    query = st.text_area("查询内容", value="今日A股行业板块资金流入排名，显示板块名称、涨跌幅、主力净流入、成交额、领涨股", height=90)
     q = shlex.quote(query)
     run_variants = [
         f"{cli_name} run {skill} --query {q}",
@@ -275,39 +268,32 @@ with tabs[3]:
         f"{cli_name} {skill} {q}",
         f"{cli_name} --help",
     ]
-
     selected_cmd = st.selectbox("选择调用命令候选", run_variants)
     st.code(selected_cmd, language="bash")
-    run_timeout = st.slider("调用超时秒数", 10, 180, 60, key="run_timeout")
-
+    timeout = st.slider("调用超时秒数", 10, 240, 90)
     if st.button("🔎 执行技能调用", type="primary"):
-        code, out, err = run_cmd(selected_cmd, timeout=run_timeout)
+        code, out, err = run_cmd(selected_cmd, timeout=timeout)
         render_cmd_result(code, out, err)
 
 with tabs[4]:
     st.subheader("自定义命令")
-    st.warning("这里会在 Streamlit Cloud 容器里执行命令。不要输入包含明文 Key 的命令。Key 已通过环境变量注入。")
-    custom_cmd = st.text_area(
-        "自定义 shell 命令",
-        value="env | grep IWENCAI | sed 's/IWENCAI_API_KEY=.*/IWENCAI_API_KEY=***MASKED***/g'",
-        height=160,
-    )
-    custom_timeout = st.slider("自定义命令超时秒数", 5, 180, 30)
-
+    st.warning("这里会执行 shell 命令。不要输入明文 Key，Key 已通过环境变量注入。")
+    custom_cmd = st.text_area("自定义命令", value="env | grep IWENCAI | sed 's/IWENCAI_API_KEY=.*/IWENCAI_API_KEY=***MASKED***/g'", height=160)
+    timeout = st.slider("自定义命令超时秒数", 5, 240, 60)
     if st.button("▶️ 执行自定义命令"):
-        code, out, err = run_cmd(custom_cmd, timeout=custom_timeout)
+        code, out, err = run_cmd(custom_cmd, timeout=timeout)
         render_cmd_result(code, out, err)
 
 with tabs[5]:
-    st.subheader("接回主系统建议")
-    st.markdown(
-        """
-等这个测试台跑通后，我们只需要记录三件事：
+    st.subheader("当前判断")
+    st.markdown("""
+你 v1 测试失败的直接原因已经很明确：
 
-1. **真正可用的 CLI 命令名**
-2. **真正可用的技能调用命令格式**
-3. **返回结构**：JSON、Markdown、CSV，还是纯文本表格。
+- 官方安装脚本失败：`unzip is required but not installed`
+- 后续调用失败：`skillhub: command not found`
 
-接回主量化终端时，不再猜 REST 路径，而是用 `subprocess.run` 调用官方 CLI，并把 `IWENCAI_BASE_URL` 和 `IWENCAI_API_KEY` 从 Streamlit Secrets 注入环境变量。
-        """
-    )
+所以不是 Key 一定错，也不是技能一定不能用，而是 CLI 没有成功安装。  
+v2 通过 `packages.txt` 安装 `unzip`，再重新运行官方安装脚本。
+
+如果 v2 安装后仍然没有 `skillhub` 命令，请把“官方安装”页的完整 STDOUT/STDERR 发回来，我们继续看它实际安装出来的命令名和目录。
+""")
