@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import traceback
 from typing import Any, Dict, List, Optional
@@ -8,11 +9,10 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="pywencai 问财 Cookie 测试台",
+    page_title="pywencai 问财测试台 v2",
     page_icon="🧪",
     layout="wide",
 )
-
 
 QUERY_TYPES = {
     "A股/股票 stock": "stock",
@@ -28,32 +28,73 @@ QUERY_TYPES = {
 
 def get_secret(name: str, default: str = "") -> str:
     try:
-        v = st.secrets.get(name, "")
-        if v:
-            return str(v).strip()
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value).strip()
     except Exception:
         pass
     return default
 
 
-def mask_cookie(cookie: str) -> str:
-    if not cookie:
+def get_secret_cookie() -> str:
+    cookie = get_secret("WENCAI_COOKIE", "")
+    try:
+        section = st.secrets.get("wencai", {})
+        if isinstance(section, dict):
+            cookie = str(section.get("cookie") or cookie).strip()
+    except Exception:
+        pass
+    return cookie
+
+
+def mask_text(text: str, head: int = 16, tail: int = 10) -> str:
+    if not text:
         return "未配置"
-    if len(cookie) <= 30:
-        return cookie[:8] + "..."
-    return cookie[:16] + "..." + cookie[-12:]
+    if len(text) <= head + tail + 5:
+        return text[:8] + "..."
+    return text[:head] + "..." + text[-tail:]
+
+
+def extract_cookie_from_curl_or_headers(raw: str) -> str:
+    """支持粘贴 Copy as cURL、完整 request headers、或只有 Cookie 值。"""
+    if not raw:
+        return ""
+
+    text = raw.strip()
+
+    # 1. cURL: -H 'Cookie: xxx' 或 -H "Cookie: xxx"
+    patterns = [
+        r"-H\s+'Cookie:\s*([^']+)'",
+        r'-H\s+"Cookie:\s*([^"]+)"',
+        r"--header\s+'Cookie:\s*([^']+)'",
+        r'--header\s+"Cookie:\s*([^"]+)"',
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.I | re.S)
+        if m:
+            return m.group(1).strip()
+
+    # 2. Request Headers: Cookie: xxx
+    m = re.search(r"(?im)^cookie:\s*(.+)$", text)
+    if m:
+        return m.group(1).strip()
+
+    # 3. 如果本身就是 Cookie 值
+    if "=" in text and ";" in text and "curl " not in text.lower():
+        return text.replace("\n", " ").strip()
+
+    return ""
 
 
 def safe_import_pywencai():
     try:
         import pywencai
         return pywencai, None
-    except Exception as e:
-        return None, repr(e)
+    except Exception as exc:
+        return None, repr(exc)
 
 
 def normalize_result(res: Any):
-    """把 pywencai 可能返回的 DataFrame / dict / list 转成便于展示的结构。"""
     if res is None:
         return {"kind": "none", "frames": [], "raw": None}
 
@@ -61,7 +102,6 @@ def normalize_result(res: Any):
         return {"kind": "dataframe", "frames": [res], "raw": None}
 
     frames = []
-    raw = res
 
     def walk(x: Any):
         if isinstance(x, pd.DataFrame):
@@ -79,133 +119,157 @@ def normalize_result(res: Any):
                 walk(i)
 
     walk(res)
-
-    return {"kind": type(res).__name__, "frames": frames, "raw": raw}
-
-
-def render_raw(obj: Any):
-    try:
-        if isinstance(obj, (dict, list)):
-            st.json(obj)
-        else:
-            st.code(str(obj)[:8000], language="text")
-    except Exception:
-        st.code(repr(obj)[:8000], language="text")
+    return {"kind": type(res).__name__, "frames": frames, "raw": res}
 
 
-st.title("🧪 pywencai 问财 Cookie 测试台")
-st.caption("用于验证 pywencai + Cookie 是否能在 Streamlit 云端返回数据。跑通后再作为低频备用接口接回量化终端。")
+def render_result(res: Any):
+    normalized = normalize_result(res)
+    st.success(f"查询完成，返回类型：{normalized['kind']}")
 
-cookie = get_secret("WENCAI_COOKIE", "")
-try:
-    section = st.secrets.get("wencai", {})
-    if isinstance(section, dict):
-        cookie = str(section.get("cookie") or cookie).strip()
-except Exception:
-    pass
+    if normalized["frames"]:
+        for i, df in enumerate(normalized["frames"], start=1):
+            st.markdown(f"#### 表格 {i}：{df.shape[0]} 行 × {df.shape[1]} 列")
+            st.dataframe(df.head(200), width="stretch")
+    else:
+        st.warning("没有提取到 DataFrame，下面展示原始返回。")
+        try:
+            if isinstance(normalized["raw"], (dict, list)):
+                st.json(normalized["raw"])
+            else:
+                st.code(str(normalized["raw"])[:10000], language="text")
+        except Exception:
+            st.code(repr(normalized["raw"])[:10000], language="text")
+
+
+def cookie_quality_check(cookie: str) -> List[str]:
+    issues = []
+    if not cookie:
+        return ["没有 Cookie。"]
+    if "Cookie:" in cookie:
+        issues.append("Cookie 里还包含了 `Cookie:` 字段名，建议只保留后面的值。")
+    if "\n" in cookie:
+        issues.append("Cookie 中有换行，建议清理成一整行。")
+    if len(cookie) < 80:
+        issues.append("Cookie 看起来太短，可能没有复制完整。")
+    important = ["other_uid", "u_dpass", "u_did", "user"]
+    found = [k for k in important if k in cookie]
+    if len(found) < 2:
+        issues.append("Cookie 中没有看到常见登录字段，可能复制的不是问财查询请求的 Cookie。")
+    return issues
+
+
+st.title("🧪 pywencai 问财测试台 v2")
+st.caption("v2 支持直接粘贴浏览器 `Copy as cURL`，自动提取 Cookie，减少手动复制错误。")
+
+secret_cookie = get_secret_cookie()
 
 with st.sidebar:
-    st.header("配置检查")
-    st.write("Cookie：", mask_cookie(cookie))
+    st.header("Secrets 检查")
+    st.write("WENCAI_COOKIE：", mask_text(secret_cookie))
     st.markdown("---")
     st.info(
-        "Secrets 推荐：\n\n"
-        'WENCAI_COOKIE = "从浏览器复制的 Cookie"\n\n'
-        "或：\n\n"
-        "[wencai]\n"
-        'cookie = "从浏览器复制的 Cookie"'
+        "可选 Secrets：\n\n"
+        'WENCAI_COOKIE = "完整 Cookie"\n\n'
+        "也可以不填 Secrets，直接在页面粘贴 Copy as cURL 临时测试。"
     )
-    st.warning("Cookie 等同于网页登录凭证，不要发到聊天、GitHub、截图里。失效后需要重新复制。")
 
-pywencai, import_err = safe_import_pywencai()
-if import_err:
-    st.error("pywencai 导入失败。请检查 requirements.txt 是否安装 pywencai。")
-    st.code(import_err)
+pywencai, import_error = safe_import_pywencai()
+if import_error:
+    st.error("pywencai 导入失败。请检查 requirements.txt。")
+    st.code(import_error, language="text")
     st.stop()
 
-if not cookie:
-    st.error("未读取到 WENCAI_COOKIE。请先在 Streamlit Secrets 中配置 Cookie。")
-    st.stop()
+tab1, tab2, tab3, tab4 = st.tabs(["一键 cURL 测试", "Secrets Cookie 测试", "批量模板", "获取说明"])
 
-tabs = st.tabs(["查询测试", "批量模板", "Cookie 获取说明", "诊断信息"])
+with tab1:
+    st.subheader("一键 cURL 测试")
+    st.write("在问财网页 Network 里选中真正的查询请求，右键 `Copy → Copy as cURL`，整段粘到下面。系统会自动提取 Cookie。")
 
-with tabs[0]:
-    st.subheader("单次查询测试")
+    raw_curl = st.text_area("粘贴 Copy as cURL 或完整 Request Headers", height=220)
+    extracted_cookie = extract_cookie_from_curl_or_headers(raw_curl)
 
-    default_query = "今日A股行业板块资金流入排名，显示板块名称、涨跌幅、主力净流入、成交额、领涨股"
-    query = st.text_area("问财查询语句", value=default_query, height=100)
+    if extracted_cookie:
+        st.success("已从内容中提取到 Cookie。")
+        st.write("Cookie 预览：", mask_text(extracted_cookie))
+        issues = cookie_quality_check(extracted_cookie)
+        if issues:
+            st.warning("Cookie 检查提示：\n\n" + "\n".join([f"- {i}" for i in issues]))
+    else:
+        st.info("尚未提取到 Cookie。请粘贴 Copy as cURL，或完整 Request Headers。")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        query_type_label = st.selectbox("query_type", list(QUERY_TYPES.keys()), index=0)
-        query_type = QUERY_TYPES[query_type_label]
-    with col2:
-        perpage = st.number_input("perpage", min_value=1, max_value=100, value=50)
-    with col3:
-        retry = st.number_input("retry", min_value=1, max_value=10, value=3)
+    query = st.text_area(
+        "查询语句",
+        value="今日A股行业板块资金流入排名，显示板块名称、涨跌幅、主力净流入、成交额、领涨股",
+        height=90,
+        key="curl_query",
+    )
+    query_type = QUERY_TYPES[st.selectbox("query_type", list(QUERY_TYPES.keys()), index=0, key="curl_qt")]
+    perpage = st.number_input("perpage", min_value=1, max_value=100, value=30, key="curl_perpage")
 
-    col4, col5, col6 = st.columns(3)
-    with col4:
-        loop_opt = st.selectbox("loop", ["False", "True", "2页", "3页"], index=0)
-    with col5:
-        no_detail = st.checkbox("no_detail", value=False)
-    with col6:
-        log = st.checkbox("打印 pywencai 日志", value=False)
-
-    sort_key = st.text_input("sort_key 可选，留空即可", value="")
-    sort_order = st.selectbox("sort_order", ["desc", "asc"], index=0)
-
-    if st.button("🚀 执行 pywencai 查询", type="primary"):
-        if loop_opt == "False":
-            loop_value = False
-        elif loop_opt == "True":
-            loop_value = True
-        elif loop_opt == "2页":
-            loop_value = 2
+    if st.button("🚀 使用提取到的 Cookie 查询", type="primary"):
+        if not extracted_cookie:
+            st.error("没有提取到 Cookie。")
         else:
-            loop_value = 3
+            try:
+                with st.spinner("正在请求问财..."):
+                    res = pywencai.get(
+                        query=query,
+                        query_type=query_type,
+                        cookie=extracted_cookie,
+                        perpage=int(perpage),
+                        retry=3,
+                        loop=False,
+                        no_detail=False,
+                    )
+                render_result(res)
+            except Exception:
+                st.error("查询失败")
+                st.code(traceback.format_exc(), language="text")
 
-        kwargs = {
-            "query": query,
-            "query_type": query_type,
-            "cookie": cookie,
-            "perpage": int(perpage),
-            "retry": int(retry),
-            "loop": loop_value,
-            "no_detail": no_detail,
-            "log": log,
-        }
-        if sort_key.strip():
-            kwargs["sort_key"] = sort_key.strip()
-            kwargs["sort_order"] = sort_order
+with tab2:
+    st.subheader("Secrets Cookie 测试")
+    cookie = secret_cookie
+    st.write("Cookie 预览：", mask_text(cookie))
+    if cookie:
+        issues = cookie_quality_check(cookie)
+        if issues:
+            st.warning("Cookie 检查提示：\n\n" + "\n".join([f"- {i}" for i in issues]))
+    else:
+        st.error("Secrets 中没有 WENCAI_COOKIE。")
 
-        st.markdown("#### 调用参数")
-        safe_kwargs = dict(kwargs)
-        safe_kwargs["cookie"] = mask_cookie(cookie)
-        st.json(safe_kwargs)
+    query = st.text_area(
+        "问财查询语句",
+        value="江海股份最新价、涨跌幅、总市值、换手率、市盈率、市净率",
+        height=90,
+        key="secret_query",
+    )
+    query_type = QUERY_TYPES[st.selectbox("query_type", list(QUERY_TYPES.keys()), index=0, key="secret_qt")]
+    perpage = st.number_input("perpage", min_value=1, max_value=100, value=30, key="secret_perpage")
 
-        try:
-            with st.spinner("正在请求问财..."):
-                res = pywencai.get(**kwargs)
+    if st.button("🚀 使用 Secrets Cookie 查询", type="primary"):
+        if not cookie:
+            st.error("没有 Cookie。")
+        else:
+            try:
+                with st.spinner("正在请求问财..."):
+                    res = pywencai.get(
+                        query=query,
+                        query_type=query_type,
+                        cookie=cookie,
+                        perpage=int(perpage),
+                        retry=3,
+                        loop=False,
+                        no_detail=False,
+                    )
+                render_result(res)
+            except Exception:
+                st.error("查询失败")
+                st.code(traceback.format_exc(), language="text")
 
-            normalized = normalize_result(res)
-            st.success(f"查询完成，返回类型：{normalized['kind']}")
-
-            if normalized["frames"]:
-                for i, df in enumerate(normalized["frames"], start=1):
-                    st.markdown(f"#### 表格 {i}：{df.shape[0]} 行 × {df.shape[1]} 列")
-                    st.dataframe(df.head(200), width="stretch")
-            else:
-                st.warning("没有提取到 DataFrame。下面展示原始返回。")
-                render_raw(normalized["raw"])
-
-        except Exception:
-            st.error("查询失败")
-            st.code(traceback.format_exc(), language="text")
-
-with tabs[1]:
+with tab3:
     st.subheader("批量模板测试")
-    st.write("用于快速判断哪些类型的查询能返回数据。")
+    cookie_source = st.radio("Cookie 来源", ["cURL 提取", "Secrets"], horizontal=True)
+    test_cookie = extracted_cookie if cookie_source == "cURL 提取" else secret_cookie
 
     templates = [
         ("行业板块资金", "今日A股行业板块资金流入排名，显示板块名称、涨跌幅、主力净流入、成交额、领涨股", "stock"),
@@ -214,99 +278,76 @@ with tabs[1]:
         ("公告", "江海股份最新公告", "stock"),
         ("研报", "江海股份最新研报和机构观点", "stock"),
         ("指数", "上证指数、深证成指、创业板指、沪深300今日行情", "zhishu"),
-        ("宏观", "最近7天A股市场热点和宏观经济要闻", "stock"),
     ]
 
-    if st.button("🧭 开始批量模板测试", type="primary"):
-        records = []
-        for name, q, qt in templates:
-            try:
-                res = pywencai.get(
-                    query=q,
-                    query_type=qt,
-                    cookie=cookie,
-                    perpage=20,
-                    retry=2,
-                    loop=False,
-                    no_detail=False,
-                )
-                normalized = normalize_result(res)
-                rows = 0
-                cols = 0
-                if normalized["frames"]:
-                    rows = normalized["frames"][0].shape[0]
-                    cols = normalized["frames"][0].shape[1]
-                records.append({
-                    "模板": name,
-                    "query_type": qt,
-                    "是否成功": True,
-                    "返回类型": normalized["kind"],
-                    "首表行数": rows,
-                    "首表列数": cols,
-                    "查询语句": q,
-                    "错误": "",
-                })
-            except Exception as e:
-                records.append({
-                    "模板": name,
-                    "query_type": qt,
-                    "是否成功": False,
-                    "返回类型": "",
-                    "首表行数": 0,
-                    "首表列数": 0,
-                    "查询语句": q,
-                    "错误": repr(e),
-                })
+    if st.button("🧭 开始批量模板测试"):
+        if not test_cookie:
+            st.error("没有可用 Cookie。")
+        else:
+            records = []
+            for name, q, qt in templates:
+                try:
+                    res = pywencai.get(
+                        query=q,
+                        query_type=qt,
+                        cookie=test_cookie,
+                        perpage=20,
+                        retry=2,
+                        loop=False,
+                        no_detail=False,
+                    )
+                    normalized = normalize_result(res)
+                    rows = normalized["frames"][0].shape[0] if normalized["frames"] else 0
+                    cols = normalized["frames"][0].shape[1] if normalized["frames"] else 0
+                    records.append({
+                        "模板": name,
+                        "成功": True,
+                        "返回类型": normalized["kind"],
+                        "首表行数": rows,
+                        "首表列数": cols,
+                        "查询语句": q,
+                        "错误": "",
+                    })
+                except Exception as exc:
+                    records.append({
+                        "模板": name,
+                        "成功": False,
+                        "返回类型": "",
+                        "首表行数": 0,
+                        "首表列数": 0,
+                        "查询语句": q,
+                        "错误": repr(exc),
+                    })
+            st.dataframe(pd.DataFrame(records), width="stretch")
 
-        df = pd.DataFrame(records)
-        st.dataframe(df, width="stretch")
-
-with tabs[2]:
-    st.subheader("Cookie 怎么获取")
-
+with tab4:
+    st.subheader("最简单获取 Cookie 的办法")
     st.markdown(
         """
-### 电脑浏览器获取方式
+### 推荐方式：直接复制 cURL，不用自己找 Cookie
 
-1. 用 Chrome / Edge 打开 **iwencai.com**，登录你的问财账号。
-2. 打开问财页面，随便搜索一个问题，比如：`今日涨幅靠前的股票`。
-3. 按 **F12** 打开开发者工具。
-4. 进入 **Network / 网络**。
-5. 刷新页面或重新搜索一次。
-6. 在请求列表里点一个问财相关请求。
-7. 在右侧 **Headers / 请求标头** 里找到：
+1. 电脑打开问财网页并登录。
+2. 搜索一句真实问题，比如：`今日A股行业板块资金流入排名`。
+3. 按 F12 打开开发者工具。
+4. 点 Network / 网络。
+5. 重新搜索一次。
+6. 在请求列表里找一个真正查询数据的请求。
+7. 右键这个请求。
+8. 选择：
    ```text
-   Cookie: xxxxx
+   Copy → Copy as cURL
    ```
-8. 只复制 `Cookie:` 后面的整段值，不要复制 `Cookie:` 这几个字。
-9. 放到 Streamlit Secrets：
-
-```toml
-WENCAI_COOKIE = "复制来的整段 Cookie"
-```
-
-### 手机怎么弄
-
-手机浏览器不方便复制完整 Cookie。更稳的方法是：
-
-- 用电脑浏览器获取；
-- 或在手机上用 Kiwi Browser / 支持开发者工具的浏览器；
-- 或先在电脑复制 Cookie 保存到自己的密码管理器/备忘录，再粘到 Streamlit Secrets。
+   中文一般是：
+   ```text
+   复制 → 复制为 cURL
+   ```
+9. 回到本测试台，粘到“一键 cURL 测试”里。
+10. 系统会自动从 cURL 里提取 Cookie。
 
 ### 注意
 
-Cookie 等同于你的网页登录状态，不要发给别人，不要传到 GitHub，不要发到聊天窗口。Cookie 失效后重新复制即可。
+- 不要把 cURL 或 Cookie 发给别人。
+- 不要上传到 GitHub。
+- Cookie 失效后，重新复制一次 cURL 即可。
         """
     )
-
-with tabs[3]:
-    st.subheader("诊断信息")
-    import sys
-    st.write("Python：", sys.version)
-    try:
-        import py_mini_racer
-        st.write("py_mini_racer：已安装")
-    except Exception as e:
-        st.write("py_mini_racer：", repr(e))
-    st.write("pywencai：", getattr(pywencai, "__version__", "未知版本"))
-    st.write("Cookie：", mask_cookie(cookie))
